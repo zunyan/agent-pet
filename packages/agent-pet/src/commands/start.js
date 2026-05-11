@@ -1,9 +1,20 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
+const { ensureServer, writePidFile, PID_DIR } = require('../utils/server-control');
+
+const PET_PID_FILE = path.join(PID_DIR, 'pet-desktop.pid');
 
 async function start() {
   console.log('🐾 Starting agent-pet...');
+
+  // 先确保 terminal-server 已运行
+  try {
+    await ensureServer();
+  } catch (e) {
+    console.error(`❌ Failed to start terminal-server: ${e.message}`);
+    process.exit(1);
+  }
 
   // 查找 pet-desktop 目录
   const possiblePaths = [
@@ -49,25 +60,28 @@ async function start() {
   const env = { ...process.env };
   delete env.ELECTRON_RUN_AS_NODE;
 
+  let child;
   if (process.platform === 'win32') {
     // Windows: 直接启动 electron
     const electronExe = path.join(nodeModulesPath, 'electron/dist/electron.exe');
-    spawn(electronExe, [mainPath], {
+    child = spawn(electronExe, [mainPath], {
       cwd: desktopPath,
       env,
       detached: true,
       stdio: 'ignore'
-    }).unref();
+    });
   } else {
-    spawn(electronPath, [mainPath], {
+    child = spawn(electronPath, [mainPath], {
       detached: true,
       env,
       cwd: desktopPath,
       stdio: 'ignore'
-    }).unref();
+    });
   }
+  child.unref();
+  writePidFile(PET_PID_FILE, child.pid);
 
-  console.log('✅ Desktop pet started in background');
+  console.log(`✅ Desktop pet started in background (pid ${child.pid})`);
 
   // 等待一小段时间让进程启动
   await new Promise(r => setTimeout(r, 500));

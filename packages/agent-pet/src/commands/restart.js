@@ -1,30 +1,48 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
+const {
+  ensureServer,
+  stopServer,
+  writePidFile,
+  readPidFile,
+  removePidFile,
+  isPidAlive,
+  PID_DIR,
+} = require('../utils/server-control');
+
+const PET_PID_FILE = path.join(PID_DIR, 'pet-desktop.pid');
 
 async function restart() {
   console.log('🔄 Restarting agent-pet...');
 
-  // 在 Windows 上尝试终止现有进程
-  if (process.platform === 'win32') {
-    const { execSync } = require('child_process');
+  // 1. 按 PID 精确停止 pet-desktop（避免误杀其他 Electron 应用）
+  const petPid = readPidFile(PET_PID_FILE);
+  if (petPid && isPidAlive(petPid)) {
     try {
-      execSync('taskkill /F /IM electron.exe 2>nul', { shell: true, stdio: 'ignore' });
+      process.kill(petPid);
+      console.log(`→ Stopped pet-desktop (pid ${petPid})`);
     } catch (e) {
-      // 进程可能不存在，忽略
-    }
-  } else {
-    try {
-      execSync('pkill -f electron', { shell: true, stdio: 'ignore' });
-    } catch (e) {
-      // 进程可能不存在，忽略
+      console.warn(`Failed to stop pet-desktop pid ${petPid}: ${e.message}`);
     }
   }
+  removePidFile(PET_PID_FILE);
 
-  // 等待进程终止
+  // 2. 停止 terminal-server
+  await stopServer();
+
+  // 等待进程清理 + 端口释放
   await new Promise(r => setTimeout(r, 500));
 
-  // 查找 pet-desktop 目录
+  // 3. 重启 terminal-server
+  try {
+    await ensureServer();
+  } catch (e) {
+    console.error(`❌ Failed to start terminal-server: ${e.message}`);
+    process.exit(1);
+  }
+
+  // 4. 查找 pet-desktop 目录
   const possiblePaths = [
     path.join(__dirname, '../../../../pets/pet-desktop'),
     path.join(process.cwd(), 'pets/pet-desktop'),
@@ -53,24 +71,28 @@ async function restart() {
 
   console.log('🚀 Starting desktop pet...');
 
+  let child;
   if (process.platform === 'win32') {
-    // Windows: 使用 PowerShell 启动 electron（隐藏窗口）
+    // Windows: 直接启动 electron.exe（与 start.js 保持一致，不再走 PowerShell）
     const electronExe = path.join(nodeModulesPath, 'electron/dist/electron.exe');
-    const psCommand = `\$env:ELECTRON_RUN_AS_NODE = \$null; Start-Process -FilePath "${electronExe}" -ArgumentList "${mainPath}" -WorkingDirectory "${desktopPath}" -WindowStyle Hidden`;
-    spawn('powershell', ['-ExecutionPolicy', 'Bypass', '-Command', psCommand], {
-      stdio: 'ignore',
-      shell: true
+    child = spawn(electronExe, [mainPath], {
+      cwd: desktopPath,
+      env,
+      detached: true,
+      stdio: 'ignore'
     });
   } else {
-    spawn(electronPath, [mainPath], {
+    child = spawn(electronPath, [mainPath], {
       detached: true,
       env,
       cwd: desktopPath,
       stdio: 'ignore'
-    }).unref();
+    });
   }
+  child.unref();
+  writePidFile(PET_PID_FILE, child.pid);
 
-  console.log('✅ Desktop pet restarted');
+  console.log(`✅ Desktop pet restarted (pid ${child.pid})`);
 
   // 等待一小段时间让进程启动
   await new Promise(r => setTimeout(r, 500));

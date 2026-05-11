@@ -53,28 +53,80 @@ function parseFrame(buffer) {
   return { type, data };
 }
 
+// Resolve claude executable path (cached for module lifetime).
+// Resolution order:
+//   1. AGENT_PET_CLAUDE_BIN env var (manual override)
+//   2. Non-Windows: 'claude' (let PATH/system resolve)
+//   3. Windows: `where claude.cmd` (first match)
+//   4. Windows: common npm install locations (APPDATA/LOCALAPPDATA)
+let _cachedClaudeBin = null;
+function resolveClaudeBin() {
+  if (_cachedClaudeBin) return _cachedClaudeBin;
+
+  // 1. Manual override
+  if (process.env.AGENT_PET_CLAUDE_BIN) {
+    _cachedClaudeBin = process.env.AGENT_PET_CLAUDE_BIN;
+    return _cachedClaudeBin;
+  }
+
+  // 2. Non-Windows: rely on PATH lookup by pty.spawn
+  if (process.platform !== 'win32') {
+    _cachedClaudeBin = 'claude';
+    return _cachedClaudeBin;
+  }
+
+  // 3. Windows: try `where claude.cmd` (swallow stderr to keep console clean)
+  const { execSync } = require('child_process');
+  const fs = require('fs');
+  try {
+    const out = execSync('where claude.cmd', {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const first = out.split(/\r?\n/)[0].trim();
+    if (first) {
+      _cachedClaudeBin = first;
+      return _cachedClaudeBin;
+    }
+  } catch (_) {
+    // not on PATH; fall through to common install locations
+  }
+
+  // 4. Windows: check common npm install locations
+  const candidates = [
+    path.join(process.env.APPDATA || '', 'npm', 'claude.cmd'),
+    path.join(process.env.LOCALAPPDATA || '', 'npm', 'claude.cmd'),
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        _cachedClaudeBin = candidate;
+        return _cachedClaudeBin;
+      }
+    } catch (_) {
+      // ignore and continue
+    }
+  }
+
+  throw new Error(
+    "claude executable not found. Please ensure 'claude' is in PATH, or set AGENT_PET_CLAUDE_BIN env var to the full path."
+  );
+}
+
 // Spawn PTY with proper settings
 function spawnPty(cwd, sessionId, cols = 120, rows = 40) {
-  const isWindows = process.platform === 'win32';
   const pty = require('node-pty');
-  if (isWindows) {
-    return pty.spawn('C:\\Users\\kezun\\AppData\\Roaming\\npm\\claude.cmd', ['--dangerously-skip-permissions', '--session-id', sessionId], {
-      name: 'xterm-256color',
-      cols,
-      rows,
-      cwd,
-      env: { ...process.env },
-      useConpty: true,
-    });
-  } else {
-    return pty.spawn('claude', ['--dangerously-skip-permissions', '--session-id', sessionId], {
-      name: 'xterm-256color',
-      cols,
-      rows,
-      cwd,
-      env: { ...process.env },
-    });
-  }
+  const claudeBin = resolveClaudeBin();
+  const args = ['--dangerously-skip-permissions', '--session-id', sessionId];
+  const opts = {
+    name: 'xterm-256color',
+    cols,
+    rows,
+    cwd,
+    env: { ...process.env },
+  };
+  if (process.platform === 'win32') opts.useConpty = true;
+  return pty.spawn(claudeBin, args, opts);
 }
 
 // Generate session ID (use UUID format to match hook)
@@ -113,6 +165,12 @@ function buildHookSummary(toolName, toolInput) {
   }
 }
 
+// Notification types that genuinely mean "waiting for user input".
+// Other notification types (auth_success, elicitation_complete,
+// elicitation_response, ...) are pure status updates and must not flip
+// a task into the waiting state.
+const WAITING_NOTIFICATION_TYPES = ['permission_prompt', 'idle_prompt', 'elicitation_dialog'];
+
 function processHookEvent(data) {
   const sessionId = data.session_id || 'unknown';
   const cwd = data.cwd || '';
@@ -120,11 +178,93 @@ function processHookEvent(data) {
   const hookEvent = data.hook_event_name || '';
   const timestamp = new Date().toISOString();
 
+  // R1: PermissionRequest must short-circuit BEFORE the toolName branch.
+  // Real PermissionRequest payloads include tool_name (Bash/Edit/...), so
+  // without this guard they would be claimed by the toolName branch and
+  // never set status to 'waiting'. This is the highest-ROI fix.
+  if (hookEvent === 'PermissionRequest' || data.permission_required) {
+    const toolInput = data.tool_input || {};
+    const fallbackTarget = toolInput.command || toolInput.file_path || '';
+    const waitingMessage = data.message
+      ? String(data.message).slice(0, 80)
+      : `${toolName || 'Permission'}: ${fallbackTarget}`.slice(0, 80);
+    const existing = hookTasks.get(sessionId);
+    if (existing) {
+      existing.status = 'waiting';
+      existing.lastActivity = timestamp;
+      existing.waitingMessage = waitingMessage;
+      existing.lastToolSummary = waitingMessage;
+      existing.completedAt = null;
+    } else {
+      hookTasks.set(sessionId, {
+        id: sessionId, cwd, status: 'waiting',
+        startedAt: timestamp, lastActivity: timestamp,
+        toolCount: 0, lastTool: toolName || '',
+        lastToolSummary: waitingMessage,
+        waitingMessage,
+        completedAt: null
+      });
+    }
+    console.log(`[hook] PermissionRequest -> waiting session=${sessionId} msg="${waitingMessage}"`);
+    return;
+  }
+
   if (toolName) {
     const summary = buildHookSummary(toolName, data.tool_input || {});
     const existing = hookTasks.get(sessionId);
+
+    // R2: AskUserQuestion always means "waiting" — regardless of whether
+    // this is a brand-new task or an existing long-running session where
+    // Claude raises a mid-flow question. Previously only the new-task path
+    // set 'waiting'; existing sessions were stuck on 'working'.
+    // IMPORTANT: only intercept on PreToolUse. PostToolUse for the same
+    // tool means the user already answered, and must fall through to R6
+    // (PostToolUse + waiting -> working) so the task can resume. Without
+    // this guard the task is stuck on 'waiting' forever after answering.
+    if (toolName === 'AskUserQuestion' && hookEvent === 'PreToolUse') {
+      const question = data.tool_input && data.tool_input.questions
+        && data.tool_input.questions[0] && data.tool_input.questions[0].question;
+      const waitingMessage = (question ? String(question) : 'AskUserQuestion').slice(0, 80);
+      if (existing) {
+        existing.status = 'waiting';
+        existing.lastActivity = timestamp;
+        existing.toolCount = (existing.toolCount || 0) + 1;
+        existing.lastTool = toolName;
+        existing.lastToolSummary = summary;
+        existing.waitingMessage = waitingMessage;
+        existing.completedAt = null;
+      } else {
+        hookTasks.set(sessionId, {
+          id: sessionId, cwd, status: 'waiting',
+          startedAt: timestamp, lastActivity: timestamp,
+          toolCount: 1, lastTool: toolName, lastToolSummary: summary,
+          waitingMessage,
+          completedAt: null
+        });
+      }
+      console.log(`[hook] AskUserQuestion -> waiting session=${sessionId}`);
+      return;
+    }
+
     if (existing) {
-      if (existing.status !== 'completed' && existing.status !== 'interrupted' && existing.status !== 'waiting') {
+      // R6: PostToolUse arriving while in 'waiting' means the user has
+      // already approved and the tool has finished — flip back to 'working'
+      // so the task doesn't stay stuck on waiting forever. Other status
+      // transitions stay unchanged.
+      if (hookEvent === 'PostToolUse' && existing.status === 'waiting') {
+        existing.status = 'working';
+        existing.completedAt = null;
+        console.log(`[hook] PostToolUse -> working (was waiting) session=${sessionId}`);
+      } else if (hookEvent === 'PreToolUse' && existing.status === 'waiting') {
+        // R7: PreToolUse for a new tool while still in 'waiting' means the
+        // user rejected the previous PermissionRequest (n / ESC) and Claude
+        // moved on to a different tool. Without this branch the session
+        // stays stuck on 'waiting' forever (yellow). AskUserQuestion's
+        // PreToolUse is intercepted by R2 above and never reaches here.
+        existing.status = 'working';
+        existing.completedAt = null;
+        console.log(`[hook] PreToolUse(${toolName}) -> working (was waiting) session=${sessionId}`);
+      } else if (existing.status !== 'completed' && existing.status !== 'interrupted' && existing.status !== 'waiting') {
         existing.status = 'working';
         existing.completedAt = null;
       }
@@ -134,25 +274,32 @@ function processHookEvent(data) {
       existing.lastToolSummary = summary;
     } else {
       hookTasks.set(sessionId, {
-        id: sessionId, cwd, 
-        status: toolName === 'AskUserQuestion' ? 'waiting' : 'working',
+        id: sessionId, cwd,
+        status: 'working',
         startedAt: timestamp, lastActivity: timestamp,
         toolCount: 1, lastTool: toolName, lastToolSummary: summary, completedAt: null
       });
     }
   } else if (data.message || data.notification_type) {
+    // R4: Only treat notifications that genuinely mean "waiting for user"
+    // as waiting. Notification types like auth_success / elicitation_complete
+    // / elicitation_response are pure status updates and should not flip
+    // the task to waiting. Backwards compatibility: a notification with no
+    // notification_type but a free-form message (curl simulations) still
+    // counts as waiting.
     const existing = hookTasks.get(sessionId);
     if (existing && existing.status !== 'completed' && existing.status !== 'interrupted') {
-      existing.status = 'waiting';
+      const notificationType = data.notification_type;
+      const isWaitingNotification = notificationType
+        ? WAITING_NOTIFICATION_TYPES.includes(notificationType)
+        : Boolean(data.message);
+
       existing.lastActivity = timestamp;
-      existing.waitingMessage = (data.message || '').slice(0, 80);
-    }
-  } else if (hookEvent === 'PermissionRequest' || data.permission_required) {
-    const existing = hookTasks.get(sessionId);
-    if (existing && existing.status !== 'completed' && existing.status !== 'interrupted') {
-      existing.status = 'waiting';
-      existing.lastActivity = timestamp;
-      existing.lastToolSummary = 'Permission required';
+      if (isWaitingNotification) {
+        existing.status = 'waiting';
+        existing.waitingMessage = (data.message || notificationType || '').slice(0, 80);
+        console.log(`[hook] Notification(${notificationType || 'msg-only'}) -> waiting session=${sessionId}`);
+      }
     }
   } else if (data.prompt !== undefined) {
     const existing = hookTasks.get(sessionId);

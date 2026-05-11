@@ -114,6 +114,19 @@ function resolveSkin(skinName) {
   };
 }
 
+// --- connection error logger with throttling ---
+const _connLogState = new Map(); // key -> timestamp of last log
+function logConnError(key, err) {
+  const now = Date.now();
+  const msg = String(err && (err.cause?.code || err.message || err));
+  const isRefused = /ECONNREFUSED|fetch failed|ENOTFOUND|ECONNRESET/i.test(msg);
+  const throttleMs = isRefused ? 30_000 : 0; // 连接类错误 30s 节流；其他错误每次打
+  const last = _connLogState.get(key) || 0;
+  if (throttleMs && now - last < throttleMs) return;
+  _connLogState.set(key, now);
+  console.warn(`[Main] ${key}:`, msg);
+}
+
 let mainWindow;
 let isDragging = false;
 let dragInterval = null;
@@ -372,7 +385,7 @@ async function refreshAll() {
     try {
       const hookResp = await fetch('http://localhost:3456/api/hooks');
       hookTasks = await hookResp.json();
-    } catch (e) {}
+    } catch (e) { logConnError('hooks fetch failed', e); }
 
     // Sort hook tasks
     const statusOrder = { working: 0, waiting: 0, interrupted: 1, completed: 2 };
@@ -388,7 +401,7 @@ async function refreshAll() {
     try {
       const resp = await fetch('http://localhost:3456/api/sessions');
       sessions = await resp.json();
-    } catch (e) {}
+    } catch (e) { logConnError('sessions fetch failed', e); }
 
     // Send updates to renderer - filter out tasks that have corresponding sessions
     const sessionIds = new Set(sessions.map(s => s.id));
@@ -521,7 +534,7 @@ ipcMain.on('open-project', (event, cwd) => {
 ipcMain.on('dismiss-task', (event, taskId) => {
   // Dismiss via terminal-server
   fetch(`http://localhost:3456/api/hooks/${taskId}`, { method: 'DELETE' })
-    .catch(() => {});
+    .catch(e => logConnError('hook delete failed', e));
   refreshAll();
 });
 
