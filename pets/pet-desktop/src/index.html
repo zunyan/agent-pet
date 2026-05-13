@@ -50,7 +50,7 @@
     }
 
     body {
-      width: 200px;
+      width: 260px;
       min-height: 200px;
       height: auto;
       overflow: hidden;
@@ -60,7 +60,7 @@
     }
 
     #pet-container {
-      width: 100%;
+      width: 260px;
       height: 132px;
       position: relative;
       display: flex;
@@ -75,45 +75,55 @@
       image-rendering: pixelated;
       image-rendering: crisp-edges;
       position: absolute;
-      transition: transform 0.1s ease;
+      left: 50%;
+      bottom: 0;
+      object-fit: contain;
+      object-position: center bottom;
+      transform-origin: center bottom;
+      transform: translateX(-50%) translateY(0) scale(var(--sprite-scale, 1));
+      transition: transform 80ms ease;
+    }
+
+    #pet-container[data-state="working"] #pet-sprite {
+      --sprite-scale: 0.9;
     }
 
     /* Floating animation */
     @keyframes float {
       0%, 100% {
-        transform: translateY(0px);
+        transform: translateX(-50%) translateY(0px) scale(var(--sprite-scale, 1));
       }
       50% {
-        transform: translateY(-10px);
+        transform: translateX(-50%) translateY(-6px) scale(var(--sprite-scale, 1));
       }
     }
 
     /* Bounce animation */
     @keyframes bounce {
       0%, 100% {
-        transform: translateY(0px) scaleY(1);
+        transform: translateX(-50%) translateY(0px) scale(var(--sprite-scale, 1)) scaleY(1);
       }
       25% {
-        transform: translateY(-20px) scaleY(1.1);
+        transform: translateX(-50%) translateY(-14px) scale(var(--sprite-scale, 1)) scaleY(1.1);
       }
       50% {
-        transform: translateY(0px) scaleY(0.9);
+        transform: translateX(-50%) translateY(0px) scale(var(--sprite-scale, 1)) scaleY(0.9);
       }
       75% {
-        transform: translateY(-10px) scaleY(1.05);
+        transform: translateX(-50%) translateY(-7px) scale(var(--sprite-scale, 1)) scaleY(1.05);
       }
     }
 
     /* Click effect */
     @keyframes click-effect {
       0% {
-        transform: scale(1);
+        transform: translateX(-50%) scale(var(--sprite-scale, 1));
       }
       50% {
-        transform: scale(1.2);
+        transform: translateX(-50%) scale(1.12);
       }
       100% {
-        transform: scale(1);
+        transform: translateX(-50%) scale(var(--sprite-scale, 1));
       }
     }
 
@@ -149,6 +159,7 @@
       padding: 4px;
       background: var(--task-panel-bg);
       border-radius: 10px;
+      width: 260px;
     }
 
     #task-panel.visible {
@@ -159,10 +170,8 @@
       display: flex;
       align-items: center;
       gap: 8px;
-      /* right padding reserves room for absolutely-positioned .kill-btn
-         (right: 8px + width: 20px + 4px buffer = 32px) so text content
-         never extends into the close-button zone */
-      padding: 8px 32px 8px 10px;
+      /* right padding 32px 为 kill-btn 预留空间；左 padding 14px 给 4px 色条让位 */
+      padding: 8px 32px 8px 14px;
       border-radius: 6px;
       font-family: system-ui, -apple-system, sans-serif;
       font-size: 14px;
@@ -170,6 +179,18 @@
       position: relative;
       cursor: pointer;
       min-height: 36px;
+      overflow: hidden;
+    }
+
+    /* 左侧 4px 项目色条：按 cwd hash 映射到 6 色桶 */
+    .task-stripe {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 4px;
+      background: transparent;
+      pointer-events: none;
     }
 
     .task-item.working {
@@ -281,6 +302,8 @@
       color: var(--text-primary);
       font-weight: 600;
       font-size: 14px;
+      flex: 1;
+      min-width: 0;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -292,14 +315,30 @@
       background: var(--task-badge-bg);
       padding: 2px 6px;
       border-radius: 4px;
+      margin-left: auto;
       flex-shrink: 0;
+    }
+
+    /* 非默认 Claude permission mode 徽标；Default/manual 不渲染 */
+    .task-badge.auto,
+    .task-badge.plan,
+    .task-badge.edits,
+    .task-badge.bypass {
+      color: var(--text-secondary);
+      background: rgba(0, 0, 0, 0.06);
+      border: 1px solid rgba(0, 0, 0, 0.12);
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+      line-height: 1.2;
+      letter-spacing: 0.2px;
     }
 
     .kill-btn {
       position: absolute;
       right: 8px;
-      top: 50%;
-      transform: translateY(-50%);
+      top: 8px;
       width: 20px;
       height: 20px;
       border: none;
@@ -313,6 +352,14 @@
       align-items: center;
       justify-content: center;
       padding: 0;
+      opacity: 0;
+      pointer-events: none;
+      transition: background 120ms ease;
+    }
+
+    .task-item:hover .kill-btn {
+      opacity: 1;
+      pointer-events: auto;
     }
 
     .kill-btn:hover {
@@ -331,16 +378,44 @@
 
     /* second row of .task-content: wraps the tool summary text, fully clear
        of the absolutely-positioned .kill-btn (the .task-item right padding
-       reserves the button's column). */
+       reserves the button's column). padding-right 56px gives space to .task-time. */
     .task-summary-line {
       display: flex;
       align-items: center;
       gap: 6px;
       min-width: 0;
+      padding-right: 56px; /* 给右下角 .task-time 让位 */
     }
 
     .task-item.completed .task-summary {
       color: var(--task-summary-completed);
+    }
+
+    /* 第二行：首条 prompt 前 60 字；无值时为占位态 */
+    .task-prompt {
+      color: var(--text-primary);
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      opacity: 0.78;
+    }
+
+    .task-prompt.placeholder {
+      color: var(--text-secondary);
+      font-style: italic;
+      opacity: 0.6;
+    }
+
+    /* 右下角相对时间 */
+    .task-time {
+      position: absolute;
+      right: 8px;
+      bottom: 4px;
+      font-size: 10px;
+      color: var(--text-secondary);
+      opacity: 0.7;
+      pointer-events: none;
     }
 
     .task-dismiss {
@@ -394,7 +469,6 @@
     <img id="pet-sprite" src="" alt="Pet">
   </div>
   <div id="task-panel"></div>
-
   <script src="renderer.js"></script>
 </body>
 </html>

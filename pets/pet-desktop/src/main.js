@@ -119,6 +119,9 @@ let isDragging = false;
 let dragInterval = null;
 let dragStartMouse = { x: 0, y: 0 };
 let dragStartWindow = { x: 0, y: 0 };
+let tooltipWindow = null;
+let pendingTooltip = null;
+let tooltipReady = false;
 let wsMap = {}; // sessionId -> WebSocket
 
 // approval-alert: track sessions that have already been notified during the
@@ -276,11 +279,15 @@ console.log(`[DesktopPet] Loading skin: ${skinConfig.displayName} (${skinName})`
 // Task watching
 let taskPollInterval = null;
 
-
+const PANEL_WIDTH = 260;
+const TOOLTIP_WIDTH = 360;
+const TOOLTIP_GAP = 8;
+const MIN_WINDOW_HEIGHT = 220;
+const MAX_WINDOW_HEIGHT = 900;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 200,
+    width: PANEL_WIDTH,
     height: 200,
     frame: false,
     transparent: true,
@@ -315,11 +322,15 @@ function createWindow() {
   });
 
   mainWindow.on('closed', () => {
+    if (tooltipWindow && !tooltipWindow.isDestroyed()) {
+      tooltipWindow.close();
+    }
     mainWindow = null;
   });
 
   // Safety: stop dragging if window loses focus or is hidden
   mainWindow.on('blur', () => {
+    if (isDragging) return;
     stopDrag();
   });
 
@@ -343,6 +354,99 @@ function createWindow() {
       spritePath: skinSpritePath
     });
   });
+}
+
+function createTooltipWindow() {
+  if (tooltipWindow && !tooltipWindow.isDestroyed()) return tooltipWindow;
+
+  tooltipReady = false;
+  tooltipWindow = new BrowserWindow({
+    width: TOOLTIP_WIDTH,
+    height: 140,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    movable: false,
+    focusable: false,
+    show: false,
+    hasShadow: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'tooltip-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+
+  tooltipWindow.setMenu(null);
+  tooltipWindow.setIgnoreMouseEvents(true);
+  tooltipWindow.loadFile(path.join(__dirname, 'tooltip.html'));
+
+  tooltipWindow.webContents.on('did-finish-load', () => {
+    tooltipReady = true;
+    if (pendingTooltip && tooltipWindow && !tooltipWindow.isDestroyed()) {
+      tooltipWindow.webContents.send('tooltip-data', pendingTooltip);
+    }
+  });
+
+  tooltipWindow.on('closed', () => {
+    tooltipWindow = null;
+    pendingTooltip = null;
+    tooltipReady = false;
+  });
+
+  return tooltipWindow;
+}
+
+function positionTooltipWindow(anchor, size) {
+  if (!tooltipWindow || tooltipWindow.isDestroyed()) return;
+  const width = Math.ceil(Number(size && size.width) || TOOLTIP_WIDTH);
+  const height = Math.ceil(Number(size && size.height) || 140);
+  const gap = TOOLTIP_GAP;
+  const point = {
+    x: Math.round(anchor.x + anchor.width / 2),
+    y: Math.round(anchor.y + anchor.height / 2)
+  };
+  const display = screen.getDisplayNearestPoint(point);
+  const workArea = display.workArea;
+  const workRight = workArea.x + workArea.width;
+  const workBottom = workArea.y + workArea.height;
+  const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+  const rightX = anchor.x + anchor.width + gap;
+  const leftX = anchor.x - width - gap;
+  const rightSpace = workRight - rightX;
+  const leftSpace = leftX - workArea.x;
+  const x = rightSpace >= width || rightSpace >= leftSpace ? rightX : leftX;
+  const y = clamp(anchor.y, workArea.y + gap, Math.max(workArea.y + gap, workBottom - height - gap));
+
+  tooltipWindow.setBounds({
+    x: Math.round(clamp(x, workArea.x + gap, Math.max(workArea.x + gap, workRight - width - gap))),
+    y: Math.round(y),
+    width,
+    height
+  });
+}
+
+function showTooltipWindow(payload) {
+  if (!mainWindow || mainWindow.isDestroyed() || !payload || !payload.anchor) return;
+  const win = createTooltipWindow();
+  const wasVisible = win.isVisible();
+  pendingTooltip = payload;
+  if (tooltipReady) {
+    win.webContents.send('tooltip-data', payload);
+  }
+  positionTooltipWindow(payload.anchor, { width: TOOLTIP_WIDTH, height: 140 });
+  if (wasVisible) {
+    win.showInactive();
+  }
+}
+
+function hideTooltipWindow() {
+  pendingTooltip = null;
+  if (tooltipWindow && !tooltipWindow.isDestroyed()) {
+    tooltipWindow.hide();
+  }
 }
 
 function stopDrag() {
@@ -393,7 +497,17 @@ async function refreshAll() {
     // Send updates to renderer - filter out tasks that have corresponding sessions
     const sessionIds = new Set(sessions.map(s => s.id));
     const filteredTasks = hookTasks.filter(t => !sessionIds.has(t.id));
-    mainWindow.webContents.send('tasks-update', filteredTasks.slice(0, 5));
+    // 透传 firstPrompt/startedAt/pid（未提供时保持原值 undefined）
+    const projectedTasks = filteredTasks.slice(0, 5).map(t => ({
+      ...t,
+      type: t.type || 'auto',
+      firstPrompt: t.firstPrompt,
+      sessionTitle: t.sessionTitle,
+      permissionMode: t.permissionMode,
+      startedAt: t.startedAt,
+      pid: t.pid
+    }));
+    mainWindow.webContents.send('tasks-update', projectedTasks);
 
     // Build task lookup by id
     const taskById = {};
@@ -403,15 +517,24 @@ async function refreshAll() {
 
     const mapped = sessions.map(s => {
       const task = taskById[s.id];
+      const sessionRunning = s.status === 'running';
+      const displayStatus = task && !(sessionRunning && task.status === 'completed')
+        ? task.status
+        : (sessionRunning ? 'idle' : s.status);
       return {
         id: s.id,
         type: 'manual',
-        cwd: task ? task.cwd : s.cwd,
-        pid: s.pid,
-        status: task ? task.status : s.status,
+        cwd: (task && task.cwd) || s.cwd,
+        pid: s.pid ?? (task && task.pid),
+        status: displayStatus,
         state: s.state || 'idle',
         toolCount: task ? (task.toolCount || 0) : (s.toolCount || 0),
-        lastToolSummary: task ? (task.lastToolSummary || '') : (s.lastToolSummary || '')
+        lastToolSummary: task ? (task.lastToolSummary || '') : (s.lastToolSummary || ''),
+        // 多会话区分新字段：hookTask 优先（首条 prompt 源自 hook），缺失 fallback 到 session
+        firstPrompt: (task && task.firstPrompt) || s.firstPrompt,
+        sessionTitle: (task && task.sessionTitle) || s.sessionTitle || (task && task.firstPrompt) || s.firstPrompt,
+        permissionMode: (task && task.permissionMode) || s.permissionMode,
+        startedAt: (task && task.startedAt) || s.startedAt
       };
     });
     mainWindow.webContents.send('sessions-update', mapped);
@@ -425,21 +548,40 @@ async function refreshAll() {
       console.error('[approval-alert] reconcile error:', e);
     }
 
-    // Resize window
-    const displayedItems = filteredTasks.length + mapped.length;
-    const itemHeight = 56;
-    const addButtonHeight = 48;
-    const panelPadding = 12;
-    if (displayedItems > 0) {
-      const panelHeight = displayedItems * itemHeight + addButtonHeight + panelPadding;
-      mainWindow.setSize(260, 140 + panelHeight);
-    } else {
-      mainWindow.setSize(260, 220);
-    }
+    // Renderer reports exact content height after layout.
   } catch (err) {
     console.error('[Main] Refresh error:', err);
   }
 }
+
+ipcMain.on('resize-pet-window', (event, height) => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const nextHeight = Math.max(
+    MIN_WINDOW_HEIGHT,
+    Math.min(MAX_WINDOW_HEIGHT, Math.ceil(Number(height) || MIN_WINDOW_HEIGHT))
+  );
+  const current = mainWindow.getSize();
+  if (current[0] !== PANEL_WIDTH || Math.abs(current[1] - nextHeight) > 2) {
+    mainWindow.setSize(PANEL_WIDTH, nextHeight);
+  }
+});
+
+ipcMain.on('show-tooltip', (event, payload) => {
+  showTooltipWindow(payload);
+});
+
+ipcMain.on('hide-tooltip', () => {
+  hideTooltipWindow();
+});
+
+ipcMain.on('tooltip-size', (event, size) => {
+  if (!pendingTooltip || !pendingTooltip.anchor) return;
+  if (size && size.key && size.key !== pendingTooltip.key) return;
+  positionTooltipWindow(pendingTooltip.anchor, size);
+  if (tooltipWindow && !tooltipWindow.isDestroyed() && !tooltipWindow.isVisible()) {
+    tooltipWindow.showInactive();
+  }
+});
 
 
 app.whenReady().then(() => {
@@ -478,10 +620,20 @@ app.on('before-quit', () => {
 
 // Handle drag start from renderer
 ipcMain.on('drag-start', (event, { x, y }) => {
-  if (isDragging) return;
+  if (isDragging) {
+    stopDrag();
+  }
 
+  const startX = Number(x);
+  const startY = Number(y);
+  if (!Number.isFinite(startX) || !Number.isFinite(startY)) {
+    console.warn(`[DesktopPet] Ignoring drag-start with invalid point: ${x}, ${y}`);
+    return;
+  }
+
+  hideTooltipWindow();
   isDragging = true;
-  dragStartMouse = { x, y };
+  dragStartMouse = { x: startX, y: startY };
 
   if (mainWindow) {
     const [windowX, windowY] = mainWindow.getPosition();
@@ -490,19 +642,46 @@ ipcMain.on('drag-start', (event, { x, y }) => {
 
   // Use screen API to track mouse position at OS level every ~16ms (60fps)
   dragInterval = setInterval(() => {
-    if (!isDragging || !mainWindow) {
+    if (!isDragging || !mainWindow || mainWindow.isDestroyed()) {
       stopDrag();
       return;
     }
 
     const currentMouse = screen.getCursorScreenPoint();
+    if (!Number.isFinite(currentMouse.x) || !Number.isFinite(currentMouse.y)) {
+      console.warn(`[DesktopPet] Stopping drag with invalid cursor: ${currentMouse.x}, ${currentMouse.y}`);
+      stopDrag();
+      return;
+    }
+
     const deltaX = currentMouse.x - dragStartMouse.x;
     const deltaY = currentMouse.y - dragStartMouse.y;
+    const rawX = dragStartWindow.x + deltaX;
+    const rawY = dragStartWindow.y + deltaY;
 
-    mainWindow.setPosition(
-      dragStartWindow.x + deltaX,
-      dragStartWindow.y + deltaY
-    );
+    if (!Number.isFinite(rawX) || !Number.isFinite(rawY)) {
+      console.warn(`[DesktopPet] Stopping drag with invalid target: ${rawX}, ${rawY}`);
+      stopDrag();
+      return;
+    }
+
+    const display = screen.getDisplayNearestPoint(currentMouse);
+    const workArea = display.workArea;
+    const [windowWidth, windowHeight] = mainWindow.getSize();
+    const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+    const minX = workArea.x - windowWidth + 32;
+    const maxX = workArea.x + workArea.width - 32;
+    const minY = workArea.y;
+    const maxY = workArea.y + workArea.height - 32;
+    const nextX = Math.trunc(clamp(rawX, minX, maxX));
+    const nextY = Math.trunc(clamp(rawY, minY, maxY));
+
+    try {
+      mainWindow.setPosition(nextX, nextY);
+    } catch (err) {
+      console.warn(`[DesktopPet] Stopping drag after setPosition failed: ${err.message}`);
+      stopDrag();
+    }
   }, 16);
 });
 
@@ -605,10 +784,14 @@ ipcMain.handle('get-sessions', async () => {
     // Convert to the format expected by renderer
     return sessions.map(s => ({
       id: s.id,
-      type: 'manual',
+      type: s.type || 'manual',
       cwd: s.cwd,
       pid: s.pid,
-      status: s.status
+      status: s.status,
+      firstPrompt: s.firstPrompt,
+      permissionMode: s.permissionMode,
+      startedAt: s.startedAt,
+      lastToolSummary: s.lastToolSummary
     }));
   } catch (err) {
     console.error('[IPC] Failed to get sessions:', err);

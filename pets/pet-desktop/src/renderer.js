@@ -8,6 +8,130 @@ const STATES = {
   ERROR: 'error'
 };
 
+function permissionModeBadge(mode) {
+  switch (String(mode || '').toLowerCase()) {
+    case 'auto':
+      return { label: 'Auto', className: 'auto', title: 'Claude auto mode' };
+    case 'plan':
+      return { label: 'Plan', className: 'plan', title: 'Claude plan mode' };
+    case 'acceptedits':
+      return { label: 'Edits', className: 'edits', title: 'Claude accept edits mode' };
+    case 'bypasspermissions':
+      return { label: 'Bypass', className: 'bypass', title: 'Claude bypass permissions mode' };
+    default:
+      return null;
+  }
+}
+
+// 首条 prompt 前 60 字；超出用省略号字符截断
+function truncate(str, n) {
+  if (!str) return '';
+  return str.length > n ? str.slice(0, n) + '…' : str;
+}
+
+// Project stripe colors: same project keeps one color, visible projects avoid collisions.
+const PROJECT_STRIPE_COLORS = [
+  '#4FC3F7',
+  '#FFB74D',
+  '#81C784',
+  '#BA68C8',
+  '#F06292',
+  '#7986CB',
+  '#4DB6AC',
+  '#E57373',
+  '#DCE775',
+  '#9575CD',
+  '#64B5F6',
+  '#FF8A65'
+];
+const FALLBACK_PROJECT_STRIPE_COLOR = 'hsl(0, 0%, 70%)';
+
+function stableHash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) - h) + str.charCodeAt(i);
+    h |= 0;
+  }
+  return h >>> 0;
+}
+
+function normalizeProjectKey(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '')
+    .toLowerCase();
+}
+
+function projectKeyFor(item) {
+  if (!item) return '';
+  return normalizeProjectKey(
+    item.projectId ||
+    item.project_id ||
+    item.projectPath ||
+    item.project_path ||
+    item.repository ||
+    item.repo ||
+    item.cwd ||
+    item.project ||
+    item.projectName ||
+    item.project_name ||
+    item.name ||
+    ''
+  );
+}
+
+function colorIndexForProject(key, projectColorIndexes) {
+  if (projectColorIndexes.has(key)) {
+    return projectColorIndexes.get(key);
+  }
+
+  const preferred = stableHash(key) % PROJECT_STRIPE_COLORS.length;
+  const usedIndexes = new Set(projectColorIndexes.values());
+  let colorIndex = preferred;
+
+  for (let offset = 0; offset < PROJECT_STRIPE_COLORS.length; offset++) {
+    const candidate = (preferred + offset) % PROJECT_STRIPE_COLORS.length;
+    if (!usedIndexes.has(candidate)) {
+      colorIndex = candidate;
+      break;
+    }
+  }
+
+  projectColorIndexes.set(key, colorIndex);
+  return colorIndex;
+}
+
+function stripeColorForProject(item, projectColorIndexes) {
+  const key = projectKeyFor(item);
+  if (!key) return FALLBACK_PROJECT_STRIPE_COLOR;
+  const colorIndex = colorIndexForProject(key, projectColorIndexes);
+  return PROJECT_STRIPE_COLORS[colorIndex];
+}
+
+// 相对时间文案
+function formatRelativeTime(startedAt) {
+  if (!startedAt) return '';
+  const ts = startedAt instanceof Date ? startedAt.getTime() : new Date(startedAt).getTime();
+  if (!Number.isFinite(ts)) return '';
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 10) return '刚刚';
+  if (s < 60) return `${s}s 前`;
+  if (s < 3600) return `${Math.floor(s / 60)}m 前`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h 前`;
+  return `${Math.floor(s / 86400)}d 前`;
+}
+
+// 绝对时间（tooltip 用）
+function formatAbsoluteTime(startedAt) {
+  if (!startedAt) return '';
+  const d = startedAt instanceof Date ? startedAt : new Date(startedAt);
+  if (isNaN(d.getTime())) return '';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+         `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 // Default animation configuration (fallback)
 const DEFAULT_ANIMATION_CONFIG = {
   [STATES.IDLE]: { fps: 8, frames: 12, loop: true },
@@ -136,6 +260,8 @@ class Pet {
 
     if (!frames || frames.length === 0) return;
 
+    this.container.dataset.state = this.currentState;
+
     // Update sprite
     this.sprite.src = frames[this.currentFrame];
 
@@ -167,6 +293,7 @@ class Pet {
 
     this.currentState = newState;
     this.currentFrame = 0;
+    this.container.dataset.state = newState;
 
     // Restart animation with new state
     clearTimeout(this.animationTimer);
@@ -228,8 +355,39 @@ class Pet {
   }
 
   bindEvents() {
+    let suppressNextClick = false;
+    let dragPointerId = null;
+    let dragStartPos = { x: 0, y: 0 };
+
+    const finishDrag = (e) => {
+      if (dragPointerId === null) return;
+      if (e && e.pointerId !== undefined && e.pointerId !== dragPointerId) return;
+
+      const pointerId = dragPointerId;
+      dragPointerId = null;
+      try {
+        if (this.container.hasPointerCapture(pointerId)) {
+          this.container.releasePointerCapture(pointerId);
+        }
+      } catch (err) {
+        // Pointer capture can already be released by the browser.
+      }
+      window.electronAPI.dragEnd();
+    };
+
+    const pointerScreenPoint = (e) => ({
+      x: Number.isFinite(e.screenX) ? e.screenX : window.screenX + e.clientX,
+      y: Number.isFinite(e.screenY) ? e.screenY : window.screenY + e.clientY
+    });
+
     // Click interaction
-    this.container.addEventListener('click', () => {
+    this.container.addEventListener('click', (e) => {
+      if (suppressNextClick) {
+        e.preventDefault();
+        e.stopPropagation();
+        suppressNextClick = false;
+        return;
+      }
       this.handleClick();
     });
 
@@ -240,23 +398,29 @@ class Pet {
 
     // Drag handling — simplified: renderer only sends start/end,
     // main process tracks mouse via electron.screen API
-    let mouseDownPos = { x: 0, y: 0 };
-
-    this.container.addEventListener('mousedown', (e) => {
+    this.container.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
       // Prevent default to stop any native drag behavior / ghost image
       e.preventDefault();
-      mouseDownPos = { x: e.screenX, y: e.screenY };
-      window.electronAPI.dragStart(e.screenX, e.screenY);
+      const point = pointerScreenPoint(e);
+      dragPointerId = e.pointerId;
+      dragStartPos = point;
+      suppressNextClick = false;
+      this.container.setPointerCapture(e.pointerId);
+      window.electronAPI.dragStart(point.x, point.y);
     });
 
-    this.container.addEventListener('mouseup', () => {
-      window.electronAPI.dragEnd();
+    this.container.addEventListener('pointermove', (e) => {
+      if (e.pointerId !== dragPointerId) return;
+      const point = pointerScreenPoint(e);
+      if (Math.abs(point.x - dragStartPos.x) > 3 || Math.abs(point.y - dragStartPos.y) > 3) {
+        suppressNextClick = true;
+      }
     });
 
-    // Safety net: if mouse leaves the window during drag, end it
-    this.container.addEventListener('mouseleave', () => {
-      window.electronAPI.dragEnd();
-    });
+    this.container.addEventListener('pointerup', finishDrag);
+    this.container.addEventListener('pointercancel', finishDrag);
+    document.addEventListener('mouseup', finishDrag);
 
     // Prevent native drag behavior on the image element
     this.sprite.addEventListener('dragstart', (e) => {
@@ -325,6 +489,11 @@ class TaskList {
     this.panel = document.getElementById('task-panel');
     this.tasks = [];
     this.sessions = [];
+    this.tickTimer = null;
+    this.hoveredItemKey = null;
+    this.lastTooltipPayload = null;
+    this.projectColorIndexes = new Map();
+    this.startRelativeTimeTick();
   }
 
   setTasks(tasks) {
@@ -337,6 +506,68 @@ class TaskList {
     this.render();
   }
 
+  // 相对时间每 30s 刷一次（设计 §4.2 / AC-4）
+  startRelativeTimeTick() {
+    if (this.tickTimer) return;
+    this.tickTimer = setInterval(() => {
+      this.render();
+    }, 30000);
+  }
+
+  showTooltip(cardEl, item) {
+    const key = this.itemKey(item);
+    this.hoveredItemKey = key;
+    const displayPrompt = item.sessionTitle || item.firstPrompt || '';
+    const prompt = (displayPrompt && displayPrompt.trim())
+      ? displayPrompt
+      : '（用户尚未输入任何 prompt）';
+    const rect = cardEl.getBoundingClientRect();
+    const payload = {
+      key,
+      cwd: item.cwd || '',
+      startedAt: formatAbsoluteTime(item.startedAt) || '',
+      prompt,
+      anchor: {
+        x: Math.round(window.screenX + rect.left),
+        y: Math.round(window.screenY + rect.top),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height)
+      }
+    };
+    const payloadKey = JSON.stringify(payload);
+    if (payloadKey === this.lastTooltipPayload) return;
+
+    this.lastTooltipPayload = payloadKey;
+    window.electronAPI.showTooltip(payload);
+  }
+
+  hideTooltip() {
+    this.hoveredItemKey = null;
+    this.lastTooltipPayload = null;
+    window.electronAPI.hideTooltip();
+  }
+
+  itemKey(item) {
+    return `${item.itemType || ''}:${item.id || ''}`;
+  }
+
+  findItemByKey(items, key) {
+    if (!key) return null;
+    return items.find(item => this.itemKey(item) === key) || null;
+  }
+
+  reportWindowHeight() {
+    if (!window.electronAPI || !window.electronAPI.resizePetWindow) return;
+    requestAnimationFrame(() => {
+      const panelHeight = this.panel && this.panel.classList.contains('visible')
+        ? this.panel.offsetHeight
+        : 0;
+      const petHeight = document.getElementById('pet-container')?.offsetHeight || 0;
+      const bottomPadding = 10;
+      window.electronAPI.resizePetWindow(petHeight + panelHeight + bottomPadding);
+    });
+  }
+
   render() {
     // Combine tasks and sessions
     const allItems = [
@@ -346,46 +577,64 @@ class TaskList {
 
     this.panel.classList.add('visible');
     this.panel.innerHTML = '';
+    const hoveredItem = this.findItemByKey(allItems, this.hoveredItemKey);
+    if (!hoveredItem) {
+      this.hideTooltip();
+    }
 
     for (const item of allItems) {
       const div = document.createElement('div');
-      // Use status for display, state is only for pet animation
       const itemStatus = item.status || 'running';
       div.className = `task-item ${itemStatus}`;
-      div.dataset.type = item.itemType;  // 'task' or 'session'
+      div.dataset.type = item.itemType;
       div.dataset.id = item.id;
       div.dataset.cwd = item.cwd || '';
+      // Left 4px stripe is assigned per project.
+      const stripe = document.createElement('div');
+      stripe.className = 'task-stripe';
+      stripe.style.background = stripeColorForProject(item, this.projectColorIndexes);
+      div.appendChild(stripe);
 
       const indicator = document.createElement('div');
       indicator.className = 'task-indicator';
+      div.appendChild(indicator);
 
       const content = document.createElement('div');
       content.className = 'task-content';
 
+      // 第一行：项目名 + 非默认 Claude permission mode 徽标
       const header = document.createElement('div');
       header.className = 'task-header';
 
       const project = document.createElement('span');
       project.className = 'task-project';
       project.textContent = this.extractProjectName(item.cwd);
-
       header.appendChild(project);
 
-      // Badge for type (A/M) or status
-      if (item.itemType === 'session') {
-        // Sessions show type badge (Auto/Manual)
-        const typeBadge = document.createElement('span');
-        typeBadge.className = 'task-badge';
-        typeBadge.textContent = item.type === 'auto' ? 'A' : 'M';
-        typeBadge.title = item.type === 'auto' ? 'Auto Task' : 'Manual Session';
-        header.appendChild(typeBadge);
+      const permissionBadge = permissionModeBadge(item.permissionMode);
+      if (permissionBadge) {
+        const badge = document.createElement('span');
+        badge.className = `task-badge ${permissionBadge.className}`;
+        badge.textContent = permissionBadge.label;
+        badge.title = permissionBadge.title;
+        header.appendChild(badge);
       }
-
+      // Default/manual 不渲染徽标，避免列表噪音
       content.appendChild(header);
 
-      // Summary line — wraps the tool summary text. Placed in .task-content
-      // (NOT in .task-header) so it never collides with the absolutely-
-      // positioned .kill-btn pinned to the right edge of .task-item.
+      // 第二行：首条 prompt 前 60 字（无值显示占位）
+      const promptEl = document.createElement('div');
+      promptEl.className = 'task-prompt';
+      const displayPrompt = item.sessionTitle || item.firstPrompt || '';
+      if (displayPrompt && String(displayPrompt).trim()) {
+        promptEl.textContent = truncate(String(displayPrompt), 60);
+      } else {
+        promptEl.classList.add('placeholder');
+        promptEl.textContent = '等待首条对话…';
+      }
+      content.appendChild(promptEl);
+
+      // 第三行：lastToolSummary — 放在 .task-content（NOT .task-header）以避开右上角绝对定位的 .kill-btn
       if (item.lastToolSummary) {
         const summaryLine = document.createElement('div');
         summaryLine.className = 'task-summary-line';
@@ -401,24 +650,33 @@ class TaskList {
         content.appendChild(summaryLine);
       }
 
-      div.appendChild(indicator);
       div.appendChild(content);
 
-      // Single click handler - distinguish by type
+      // 右下角相对时间
+      const timeEl = document.createElement('span');
+      timeEl.className = 'task-time';
+      timeEl.textContent = formatRelativeTime(item.startedAt);
+      div.appendChild(timeEl);
+
+      // Single click handler
       div.addEventListener('click', () => {
         console.log('[Renderer] Click on item:', item.itemType, item.id);
         if (item.itemType === 'task') {
           window.electronAPI.openProject(item.cwd);
         } else {
-          // session - open terminal window
           window.electronAPI.openTerminalClient(item.id);
         }
       });
 
-      // Close button for all items
+      // Tooltip hover 绑定
+      div.addEventListener('mouseenter', () => this.showTooltip(div, item));
+      div.addEventListener('mouseleave', () => this.hideTooltip());
+
+      // Close button
       const closeBtn = document.createElement('button');
       closeBtn.className = 'kill-btn';
       closeBtn.textContent = '×';
+      closeBtn.setAttribute('aria-label', '关闭');
       closeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         if (item.itemType === 'session') {
@@ -430,6 +688,10 @@ class TaskList {
       div.appendChild(closeBtn);
 
       this.panel.appendChild(div);
+
+      if (this.itemKey(item) === this.hoveredItemKey) {
+        this.showTooltip(div, item);
+      }
     }
 
     // Add button at bottom
@@ -450,6 +712,7 @@ class TaskList {
 
     addRow.appendChild(addBtn);
     this.panel.appendChild(addRow);
+    this.reportWindowHeight();
   }
 
   extractProjectName(cwd) {

@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>agent-pet 多会话卡片 UI 原型 - 方案 A</title>
+<style>
+  /* ========================================================================
+     说明 banner（仅原型用，不属于真实样式）
+     ======================================================================== */
+  html, body {
+    margin: 0;
+    padding: 0;
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #2b2b2b;
+    color: #e0e0e0;
+    min-height: 100vh;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 16px 64px;
+    gap: 20px;
+  }
+  .banner {
+    background: #1a1a1a;
+    color: #cfcfcf;
+    border: 1px solid #3a3a3a;
+    border-radius: 8px;
+    padding: 12px 16px;
+    max-width: 720px;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .banner b { color: #4FC3F7; }
+  .banner ul { margin: 6px 0 0 18px; padding: 0; }
+  .banner li { margin: 2px 0; }
+
+  .stage-label {
+    color: #888;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    margin-top: 8px;
+  }
+
+  .desktop-frame {
+    /* 模拟 Electron 窗口宽度（main.js 中 setSize 第一参 260）。
+       这里放在浅色背景上，以确认 light theme 下卡片视觉。 */
+    width: 260px;
+    background: linear-gradient(180deg, #6b8eaa 0%, #8aa9c1 100%);
+    border-radius: 12px;
+    padding: 16px 0 0 0;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+    position: relative;
+  }
+  .desktop-frame .pet-placeholder {
+    width: 100%;
+    height: 132px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: rgba(255,255,255,0.85);
+    font-size: 11px;
+    letter-spacing: 1px;
+  }
+  .desktop-frame .pet-placeholder::before {
+    content: "";
+    width: 64px;
+    height: 64px;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.25);
+    border: 1px dashed rgba(255,255,255,0.6);
+    margin-right: 8px;
+  }
+
+  /* ========================================================================
+     ↓↓↓ 以下为从 pets/pet-desktop/src/index.html 抄过来的真实样式
+     仅新增了 4px 左侧色条、副标题（首条 prompt）、右下角时间、tooltip
+     ======================================================================== */
+  :root {
+    --task-panel-bg: rgba(240, 240, 240, 0.95);
+    --text-primary: #1a1a1a;
+    --text-secondary: #666666;
+    --indicator-working: #4FC3F7;
+    --indicator-completed: #66BB6A;
+    --indicator-interrupted: #EF5350;
+    --indicator-waiting: #FFC107;
+    --task-working-bg-1: rgba(79, 195, 247, 0.15);
+    --task-working-bg-2: rgba(79, 195, 247, 0.3);
+    --task-completed-bg: rgba(102, 187, 106, 0.2);
+    --task-waiting-bg-1: rgba(255, 193, 7, 0.2);
+    --task-waiting-bg-2: rgba(255, 193, 7, 0.35);
+    --task-interrupted-bg: rgba(239, 83, 80, 0.2);
+    --task-summary-completed: rgba(102, 187, 106, 0.7);
+    --task-badge-bg: rgba(0, 0, 0, 0.08);
+  }
+
+  #task-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 4px;
+    background: var(--task-panel-bg);
+    border-radius: 10px;
+    margin: 0 0 0 0;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+  }
+
+  .task-item {
+    display: flex;
+    align-items: stretch;
+    gap: 8px;
+    padding: 8px 10px 8px 14px; /* 左 padding 让出 4px 色条 + 留白 */
+    border-radius: 6px;
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+    line-height: 1.4;
+    position: relative;
+    cursor: pointer;
+    min-height: 36px;
+    overflow: hidden;
+  }
+
+  /* 左侧 4px 彩色边条（新增 - 区分同 cwd 不同 session） */
+  .task-item .session-stripe {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 4px;
+    background: transparent;
+  }
+  .task-item[data-type="session"] .session-stripe {
+    /* 颜色通过 inline style 设置 */
+  }
+
+  @keyframes progress-stripe {
+    0% { background-position: 0 0; }
+    100% { background-position: 20px 0; }
+  }
+
+  .task-item.working {
+    background: linear-gradient(
+      -45deg,
+      var(--task-working-bg-1) 25%,
+      var(--task-working-bg-2) 25%,
+      var(--task-working-bg-2) 50%,
+      var(--task-working-bg-1) 50%,
+      var(--task-working-bg-1) 75%,
+      var(--task-working-bg-2) 75%
+    );
+    background-size: 20px 20px;
+    animation: progress-stripe 1s linear infinite;
+  }
+  .task-item.completed { background: var(--task-completed-bg); }
+  .task-item.waiting {
+    background: var(--task-waiting-bg-1);
+    animation: waiting-pulse 2s ease-in-out infinite;
+  }
+  .task-item.interrupted { background: var(--task-interrupted-bg); }
+  .task-item.idle { background: var(--task-waiting-bg-1); }
+  .task-item.thinking {
+    background: linear-gradient(
+      -45deg,
+      var(--task-working-bg-1) 25%,
+      var(--task-working-bg-2) 25%,
+      var(--task-working-bg-2) 50%,
+      var(--task-working-bg-1) 50%,
+      var(--task-working-bg-1) 75%,
+      var(--task-working-bg-2) 75%
+    );
+    background-size: 20px 20px;
+    animation: progress-stripe 1s linear infinite;
+  }
+
+  @keyframes waiting-pulse {
+    0%, 100% { background-color: var(--task-waiting-bg-1); }
+    50%      { background-color: var(--task-waiting-bg-2); }
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.5; transform: scale(0.8); }
+  }
+
+  .task-indicator {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    align-self: flex-start;
+    margin-top: 6px;
+  }
+  .task-item.working   .task-indicator,
+  .task-item.thinking  .task-indicator { background: var(--indicator-working);  animation: pulse 1.5s ease-in-out infinite; }
+  .task-item.waiting   .task-indicator { background: var(--indicator-waiting); animation: pulse 1.5s ease-in-out infinite; }
+  .task-item.idle      .task-indicator { background: var(--indicator-waiting); }
+  .task-item.completed .task-indicator { background: var(--indicator-completed); }
+  .task-item.interrupted .task-indicator { background: var(--indicator-interrupted); }
+
+  .task-content {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .task-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 4px;
+  }
+
+  .task-project {
+    color: var(--text-primary);
+    font-weight: 600;
+    font-size: 14px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Auto 小标签（Manual 不显示任何徽标） */
+  .task-badge.auto {
+    color: var(--text-secondary);
+    font-size: 10px;
+    line-height: 1.2;
+    background: rgba(0, 0, 0, 0.06);
+    border: 1px solid rgba(0, 0, 0, 0.12);
+    padding: 1px 6px;
+    border-radius: 3px;
+    flex-shrink: 0;
+    margin-right: 22px; /* 给 kill-btn 让位 */
+    letter-spacing: 0.2px;
+    font-weight: 600;
+  }
+
+  /* 副标题 - 首条 prompt 前 60 字（新增） */
+  .task-prompt {
+    color: var(--text-primary);
+    font-size: 12px;
+    opacity: 0.78;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 1px;
+  }
+  .task-prompt.placeholder {
+    color: var(--text-secondary);
+    font-style: italic;
+    opacity: 0.6;
+  }
+
+  .task-summary {
+    color: var(--text-secondary);
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding-right: 56px; /* 给右下角相对时间留位，避免重合 */
+  }
+  .task-item.completed .task-summary { color: var(--task-summary-completed); }
+
+  /* 右下角相对时间（新增） */
+  .task-time {
+    position: absolute;
+    right: 8px;
+    bottom: 4px;
+    font-size: 10px;
+    color: var(--text-secondary);
+    opacity: 0.7;
+    pointer-events: none;
+  }
+
+  /* 关闭按钮 - 沿用原样式，但默认隐藏，hover 卡片时显现 */
+  .kill-btn {
+    position: absolute;
+    right: 8px;
+    top: 6px;
+    width: 20px;
+    height: 20px;
+    border: none;
+    border-radius: 4px;
+    background: rgba(239, 83, 80, 0.5);
+    color: #EF5350;
+    font-size: 16px;
+    font-weight: bold;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    opacity: 0;
+    transition: opacity 0.12s;
+  }
+  .task-item:hover .kill-btn { opacity: 1; }
+  .kill-btn:hover { background: rgba(239, 83, 80, 0.8); }
+
+  /* + 按钮行 */
+  .add-row {
+    display: flex;
+    justify-content: center;
+    padding: 8px;
+    min-height: 36px;
+    align-items: center;
+  }
+  .add-btn {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    background: rgba(79, 195, 247, 0.4);
+    border: 2px solid rgba(79, 195, 247, 0.6);
+    color: #4FC3F7;
+    font-size: 20px;
+    font-weight: bold;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+  }
+  .add-btn:hover { background: rgba(79, 195, 247, 0.6); }
+
+  /* ========================================================================
+     Tooltip 浮层（新增）
+     ======================================================================== */
+  #card-tooltip {
+    position: fixed;
+    z-index: 9999;
+    min-width: 240px;
+    max-width: 360px;
+    background: rgba(20, 20, 20, 0.96);
+    color: #e8e8e8;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 11.5px;
+    line-height: 1.55;
+    box-shadow: 0 8px 28px rgba(0,0,0,0.45);
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(4px);
+    transition: opacity 0.12s ease, transform 0.12s ease;
+  }
+  #card-tooltip.show {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  #card-tooltip .row { display: flex; gap: 6px; margin: 2px 0; }
+  #card-tooltip .label {
+    color: rgba(255,255,255,0.45);
+    flex-shrink: 0;
+    min-width: 48px;
+    font-size: 11px;
+  }
+  #card-tooltip .value {
+    color: #f0f0f0;
+    word-break: break-all;
+    white-space: normal;
+  }
+  #card-tooltip .value.mono {
+    font-family: 'Consolas', 'Menlo', monospace;
+    font-size: 11px;
+  }
+  #card-tooltip .divider {
+    height: 1px;
+    background: rgba(255,255,255,0.08);
+    margin: 6px 0;
+  }
+  #card-tooltip .prompt-full {
+    color: #cfe9ff;
+    font-size: 11.5px;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+
+<div class="banner">
+  <b>方案 A · 多会话卡片 UI 高保真原型 · v3</b>　用于 UI 确认
+  <ul>
+    <li><b>本轮变更（v3）</b>：Auto 标签改为灰色（雇主反馈）</li>
+    <li><b>上轮变更（v2）</b>：① 徽标精简 —— Manual 会话不再显示任何徽标，仅 Auto 任务显示小号 "Auto" 标签；② 按项目着色 —— 左侧 4px 色条改为按 cwd hash，同项目同色；③ 底行修复 —— lastToolSummary 加 padding-right 并省略号截断，避免与右下角时间重合</li>
+    <li>鼠标悬停任一卡片可查看完整 tooltip（含完整 cwd、完整首条 prompt、PID、启动时间）</li>
+    <li>左侧 4px 彩色边条由 cwd hash 自动生成（6 色桶，60° 步进），同项目一眼识别</li>
+    <li>悬停卡片时右上角显现红色 × 关闭按钮</li>
+    <li>所有颜色 / 字号 / 圆角 / 间距均直接抄自 <code>pets/pet-desktop/src/index.html</code> 的现有变量与样式</li>
+  </ul>
+</div>
+
+<div class="stage-label">Pet 桌宠窗口（260px 宽，与 main.js setSize 一致）</div>
+
+<div class="desktop-frame">
+  <div class="pet-placeholder">PET SPRITE</div>
+  <div id="task-panel"></div>
+</div>
+
+<!-- Tooltip 浮层（全局唯一） -->
+<div id="card-tooltip" role="tooltip">
+  <div class="row">
+    <span class="label">cwd</span>
+    <span class="value mono" data-field="cwd"></span>
+  </div>
+  <div class="row">
+    <span class="label">PID</span>
+    <span class="value mono" data-field="pid"></span>
+  </div>
+  <div class="row">
+    <span class="label">启动</span>
+    <span class="value mono" data-field="startedAt"></span>
+  </div>
+  <div class="divider"></div>
+  <div class="prompt-full" data-field="firstPrompt"></div>
+</div>
+
+<script>
+  // --------------------------------------------------------------------------
+  // 模拟数据 - 覆盖需求中 6 个场景
+  // --------------------------------------------------------------------------
+  const NOW = Date.now();
+  const MOCK = [
+    // 场景 1a: 同项目多会话之一 - working
+    {
+      id: 'sess-7f3a9b1c',
+      itemType: 'session',
+      type: 'manual',
+      cwd: 'D:\\projects\\agent-pet',
+      pid: 18432,
+      status: 'working',
+      firstPrompt: '帮我修复登录页 bug：用户输入错误密码三次后应该锁定 5 分钟，但现在没有锁定逻辑，参考 docs/SPEC-AUTH.md 的安全规范实现',
+      lastToolSummary: '⎿ Running Write in pets/pet-desktop/src/renderer.js…',
+      startedAt: NOW - 32 * 1000, // 30s 前
+    },
+    // 场景 1b: 同项目多会话之二 - waiting
+    {
+      id: 'sess-2e8c44d7',
+      itemType: 'session',
+      type: 'manual',
+      cwd: 'D:\\projects\\agent-pet',
+      pid: 19108,
+      status: 'waiting',
+      firstPrompt: '设计简报任务接口 API：参考分析任务复用同一套 endpoint，通过 type 参数区分，输出 OpenAPI 文档',
+      lastToolSummary: '等待用户确认',
+      startedAt: NOW - 2 * 60 * 1000, // 2m 前
+    },
+    // 场景 1c: 同项目多会话之三 - idle
+    {
+      id: 'sess-9bd14fe0',
+      itemType: 'session',
+      type: 'manual',
+      cwd: 'D:\\projects\\agent-pet',
+      pid: 19874,
+      status: 'idle',
+      firstPrompt: '写一份多会话区分功能的 requirements.md 需求文档，放到 specs/multi-session-ui/',
+      lastToolSummary: 'Write specs/multi-session-ui/requirements.md',
+      startedAt: NOW - 14 * 60 * 1000, // 14m 前
+    },
+    // 场景 2: 没说话的新会话
+    {
+      id: 'sess-5a0211ff',
+      itemType: 'session',
+      type: 'manual',
+      cwd: 'D:\\projects\\agent-pet',
+      pid: 20015,
+      status: 'idle',
+      firstPrompt: '', // 空 → 显示占位
+      lastToolSummary: '',
+      startedAt: NOW - 4 * 1000, // 刚刚
+    },
+    // 场景 3: 不同项目
+    {
+      id: 'sess-c83d77ab',
+      itemType: 'session',
+      type: 'manual',
+      cwd: 'D:\\projects\\some-other-project',
+      pid: 20488,
+      status: 'working',
+      firstPrompt: '把 webpack 配置迁移到 vite，注意保留 alias 和 env 变量映射',
+      lastToolSummary: 'Read vite.config.ts',
+      startedAt: NOW - 5 * 60 * 1000, // 5m 前
+    },
+    // 场景 4: Auto Task（A 徽标）
+    {
+      id: 'sess-auto-001',
+      itemType: 'session',
+      type: 'auto',
+      cwd: 'D:\\projects\\agent-pet',
+      pid: 20999,
+      status: 'completed',
+      firstPrompt: '[Auto] 每日代码 review：扫描 pet-desktop 最近 24h 的提交，输出风险点清单',
+      lastToolSummary: 'Bash git log --since=24h',
+      startedAt: NOW - 1 * 60 * 60 * 1000, // 1h 前
+    },
+  ];
+
+  // --------------------------------------------------------------------------
+  // 工具函数
+  // --------------------------------------------------------------------------
+  function extractProjectName(cwd) {
+    if (!cwd) return 'unknown';
+    const parts = cwd.replace(/\\/g, '/').split('/');
+    return parts[parts.length - 1] || 'unknown';
+  }
+
+  // 字符串 hash → HSL 颜色，按 cwd 分桶：同项目必同色，不同项目色相分明
+  function stripeColorFor(cwd) {
+    const key = cwd || '';
+    let h = 0;
+    for (let i = 0; i < key.length; i++) {
+      h = ((h << 5) - h) + key.charCodeAt(i);
+      h |= 0;
+    }
+    const buckets = 6; // 0, 60, 120, 180, 240, 300
+    const idx = Math.abs(h) % buckets;
+    const hue = idx * 60;
+    return `hsl(${hue}, 70%, 55%)`;
+  }
+
+  function truncate(str, n) {
+    if (!str) return '';
+    return str.length > n ? str.slice(0, n) + '…' : str;
+  }
+
+  function relativeTime(ts) {
+    const diff = Math.max(0, Date.now() - ts);
+    const s = Math.floor(diff / 1000);
+    if (s < 10) return '刚刚';
+    if (s < 60) return `${s}s 前`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m 前`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h 前`;
+    const d = Math.floor(h / 24);
+    return `${d}d 前`;
+  }
+
+  function formatAbsoluteTime(ts) {
+    const d = new Date(ts);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+           `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  // --------------------------------------------------------------------------
+  // 渲染面板
+  // --------------------------------------------------------------------------
+  const panel = document.getElementById('task-panel');
+  const tooltip = document.getElementById('card-tooltip');
+
+  function render() {
+    panel.innerHTML = '';
+
+    for (const item of MOCK) {
+      const div = document.createElement('div');
+      div.className = `task-item ${item.status}`;
+      div.dataset.type = item.itemType;
+      div.dataset.id = item.id;
+
+      // 左侧 4px 色条（仅 session 显示，task 不显示以保持兼容）
+      const stripe = document.createElement('div');
+      stripe.className = 'session-stripe';
+      if (item.itemType === 'session') {
+        stripe.style.background = stripeColorFor(item.cwd);
+      }
+      div.appendChild(stripe);
+
+      // 状态点
+      const indicator = document.createElement('div');
+      indicator.className = 'task-indicator';
+      div.appendChild(indicator);
+
+      // 内容区
+      const content = document.createElement('div');
+      content.className = 'task-content';
+
+      // 第一行：项目名 + A/M 徽标
+      const header = document.createElement('div');
+      header.className = 'task-header';
+      const project = document.createElement('span');
+      project.className = 'task-project';
+      project.textContent = extractProjectName(item.cwd);
+      header.appendChild(project);
+
+      if (item.itemType === 'session' && item.type === 'auto') {
+        const badge = document.createElement('span');
+        badge.className = 'task-badge auto';
+        badge.textContent = 'Auto';
+        badge.title = 'Auto Task';
+        header.appendChild(badge);
+      }
+      // Manual 会话不显示任何徽标（v2 调整）
+      content.appendChild(header);
+
+      // 第二行：首条 prompt 前 60 字
+      const prompt = document.createElement('div');
+      prompt.className = 'task-prompt';
+      if (item.firstPrompt && item.firstPrompt.trim()) {
+        prompt.textContent = truncate(item.firstPrompt, 60);
+      } else {
+        prompt.classList.add('placeholder');
+        prompt.textContent = '等待首条对话…';
+      }
+      content.appendChild(prompt);
+
+      // 第三行：lastToolSummary（保留）
+      if (item.lastToolSummary) {
+        const summary = document.createElement('div');
+        summary.className = 'task-summary';
+        if (item.status === 'completed') {
+          summary.textContent = '✓ ' + item.lastToolSummary;
+        } else {
+          summary.textContent = item.lastToolSummary;
+        }
+        content.appendChild(summary);
+      }
+
+      div.appendChild(content);
+
+      // 右下角相对时间
+      const timeEl = document.createElement('span');
+      timeEl.className = 'task-time';
+      timeEl.dataset.startedAt = item.startedAt;
+      timeEl.textContent = relativeTime(item.startedAt);
+      div.appendChild(timeEl);
+
+      // 关闭按钮（hover 显现）
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'kill-btn';
+      closeBtn.textContent = '×';
+      closeBtn.title = '关闭会话';
+      closeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        // 原型不真删，只视觉反馈
+        div.style.transition = 'opacity 0.18s';
+        div.style.opacity = '0.3';
+      });
+      div.appendChild(closeBtn);
+
+      // ---- Tooltip 交互 ----
+      div.addEventListener('mouseenter', () => showTooltip(div, item));
+      div.addEventListener('mousemove', (e) => positionTooltip(div));
+      div.addEventListener('mouseleave', () => hideTooltip());
+
+      panel.appendChild(div);
+    }
+
+    // + 按钮
+    const addRow = document.createElement('div');
+    addRow.className = 'add-row';
+    const addBtn = document.createElement('button');
+    addBtn.className = 'add-btn';
+    addBtn.textContent = '+';
+    addRow.appendChild(addBtn);
+    panel.appendChild(addRow);
+  }
+
+  // --------------------------------------------------------------------------
+  // Tooltip 控制
+  // --------------------------------------------------------------------------
+  function showTooltip(cardEl, item) {
+    tooltip.querySelector('[data-field="cwd"]').textContent = item.cwd || '(无)';
+    tooltip.querySelector('[data-field="pid"]').textContent = item.pid != null ? item.pid : '(无)';
+    tooltip.querySelector('[data-field="startedAt"]').textContent = formatAbsoluteTime(item.startedAt);
+    const pf = tooltip.querySelector('[data-field="firstPrompt"]');
+    if (item.firstPrompt && item.firstPrompt.trim()) {
+      pf.textContent = item.firstPrompt;
+      pf.style.color = '#cfe9ff';
+      pf.style.fontStyle = 'normal';
+    } else {
+      pf.textContent = '（用户尚未输入任何 prompt）';
+      pf.style.color = 'rgba(255,255,255,0.45)';
+      pf.style.fontStyle = 'italic';
+    }
+    positionTooltip(cardEl);
+    tooltip.classList.add('show');
+  }
+
+  function positionTooltip(cardEl) {
+    const rect = cardEl.getBoundingClientRect();
+    // 期望显示在卡片右下角附近，但不要遮挡卡片
+    // 优先放右侧；若右侧空间不足，放左侧
+    const padding = 8;
+    const ttW = tooltip.offsetWidth || 280;
+    const ttH = tooltip.offsetHeight || 100;
+
+    let left = rect.right + padding;
+    let top = rect.bottom - 8; // 对齐卡片底部
+
+    if (left + ttW > window.innerWidth - 8) {
+      // 右侧放不下 → 放卡片左侧
+      left = rect.left - ttW - padding;
+    }
+    if (left < 8) left = 8;
+
+    if (top + ttH > window.innerHeight - 8) {
+      top = window.innerHeight - ttH - 8;
+    }
+    if (top < 8) top = 8;
+
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = top + 'px';
+  }
+
+  function hideTooltip() {
+    tooltip.classList.remove('show');
+  }
+
+  // --------------------------------------------------------------------------
+  // 相对时间每 10s 刷新（让 "刚刚 / 30s 前" 不停摆）
+  // --------------------------------------------------------------------------
+  function refreshTimes() {
+    document.querySelectorAll('.task-time').forEach(el => {
+      const ts = Number(el.dataset.startedAt);
+      if (!Number.isNaN(ts)) el.textContent = relativeTime(ts);
+    });
+  }
+  setInterval(refreshTimes, 10 * 1000);
+
+  // 启动
+  render();
+</script>
+
+</body>
+</html>
